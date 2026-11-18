@@ -1,0 +1,1072 @@
+diff --git a/app/src/main/assets/framegen/blit.frag b/app/src/main/assets/framegen/blit.frag
+new file mode 100644
+index 0000000..1564e9f
+--- /dev/null
++++ b/app/src/main/assets/framegen/blit.frag
+@@ -0,0 +1,11 @@
++#version 300 es
++precision highp float;
++
++uniform sampler2D frame;
++
++in vec2 vUV;
++layout(location = 0) out vec4 outColor;
++
++void main() {
++    outColor = vec4(textureLod(frame, vUV, 0.0).rgb, 1.0);
++}
+diff --git a/app/src/main/assets/framegen/flow.frag b/app/src/main/assets/framegen/flow.frag
+new file mode 100644
+index 0000000..0146581
+--- /dev/null
++++ b/app/src/main/assets/framegen/flow.frag
+@@ -0,0 +1,87 @@
++#version 300 es
++// Bilateral motion estimation. For every texel of the in-between frame it looks for the vector v
++// that makes frameA sampled at (p - v/2) look like frameB sampled at (p + v/2).
++// The vector is stored in flow texels with 1/8 texel precision: byte = v * 8 + 128.
++precision highp float;
++
++uniform sampler2D frameA;
++uniform sampler2D frameB;
++uniform sampler2D coarseFlow;
++uniform float lod;          // mip level of the frames that matches this flow level
++uniform vec2 texel;         // one flow texel in UV units
++uniform float coarseScale;  // 0: no prediction, 2: prediction from the coarser level, 1: same level
++uniform int radius;         // search radius in steps
++uniform float stepSize;     // distance between candidates in flow texels
++uniform int propagate;      // 1: candidates are the vectors of the neighbouring texels of coarseFlow
++
++in vec2 vUV;
++layout(location = 0) out vec4 outFlow;
++
++const float MAX_FLOW = 15.875;
++const float SMOOTH_WEIGHT = 0.06;
++const float ZERO_WEIGHT = 0.004;
++
++vec2 decodeFlow(vec2 e) {
++    return (e * 255.0 - 128.0) / 8.0;
++}
++
++vec2 encodeFlow(vec2 v) {
++    return (v * 8.0 + 128.0) / 255.0;
++}
++
++float matchCost(vec2 v) {
++    vec2 h = 0.5 * v * texel;
++    float cost = 0.0;
++    for (int y = -1; y <= 1; y++) {
++        for (int x = -1; x <= 1; x++) {
++            vec2 o = vUV + vec2(float(x), float(y)) * texel;
++            vec3 d = abs(textureLod(frameA, o - h, lod).rgb - textureLod(frameB, o + h, lod).rgb);
++            cost += d.r + d.g + d.b;
++        }
++    }
++    return cost;
++}
++
++void main() {
++    float bestCost = 1.0e9;
++    float bestSad = 0.0;
++    vec2 bestFlow = vec2(0.0);
++
++    if (propagate == 1) {
++        // Take the best vector among the neighbours. This spreads good vectors and removes outliers.
++        for (int y = -1; y <= 1; y++) {
++            for (int x = -1; x <= 1; x++) {
++                vec2 o = vec2(float(x), float(y));
++                vec2 v = decodeFlow(texture(coarseFlow, vUV + o * texel * stepSize).rg) * coarseScale;
++                float sad = matchCost(v);
++                float cost = sad + SMOOTH_WEIGHT * 0.5 * length(o);
++                if (cost < bestCost) {
++                    bestCost = cost;
++                    bestSad = sad;
++                    bestFlow = v;
++                }
++            }
++        }
++    }
++    else {
++        vec2 base = vec2(0.0);
++        if (coarseScale > 0.0) base = decodeFlow(texture(coarseFlow, vUV).rg) * coarseScale;
++        bestFlow = base;
++
++        for (int y = -radius; y <= radius; y++) {
++            for (int x = -radius; x <= radius; x++) {
++                vec2 d = vec2(float(x), float(y)) * stepSize;
++                vec2 v = clamp(base + d, vec2(-MAX_FLOW), vec2(MAX_FLOW));
++                float sad = matchCost(v);
++                float cost = sad + SMOOTH_WEIGHT * length(d) + ZERO_WEIGHT * length(v);
++                if (cost < bestCost) {
++                    bestCost = cost;
++                    bestSad = sad;
++                    bestFlow = v;
++                }
++            }
++        }
++    }
++
++    outFlow = vec4(encodeFlow(bestFlow), clamp(bestSad / 27.0 * 4.0, 0.0, 1.0), 1.0);
++}
+diff --git a/app/src/main/assets/framegen/fullscreen.vert b/app/src/main/assets/framegen/fullscreen.vert
+new file mode 100644
+index 0000000..89b05d1
+--- /dev/null
++++ b/app/src/main/assets/framegen/fullscreen.vert
+@@ -0,0 +1,9 @@
++#version 300 es
++// Full-screen triangle generated from the vertex index, so no vertex buffers are needed.
++out vec2 vUV;
++
++void main() {
++    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
++    vUV = p;
++    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
+diff --git a/app/src/main/assets/framegen/warp.frag b/app/src/main/assets/framegen/warp.frag
+new file mode 100644
+index 0000000..c5fdcb9
+--- /dev/null
++++ b/app/src/main/assets/framegen/warp.frag
+@@ -0,0 +1,36 @@
++#version 300 es
++// Builds the in-between frame at time t (0 = frameA, 1 = frameB) from the motion field.
++precision highp float;
++
++uniform sampler2D frameA;
++uniform sampler2D frameB;
++uniform sampler2D flow;
++uniform vec2 flowTexel;     // one flow texel in UV units
++uniform float t;
++
++in vec2 vUV;
++layout(location = 0) out vec4 outColor;
++
++float maxComponent(vec3 v) {
++    return max(v.r, max(v.g, v.b));
++}
++
++void main() {
++    vec2 v = (texture(flow, vUV).rg * 255.0 - 128.0) / 8.0 * flowTexel;
++
++    vec3 a0 = textureLod(frameA, vUV, 0.0).rgb;
++    vec3 b0 = textureLod(frameB, vUV, 0.0).rgb;
++    vec3 a = textureLod(frameA, vUV - t * v, 0.0).rgb;
++    vec3 b = textureLod(frameB, vUV + (1.0 - t) * v, 0.0).rgb;
++
++    // Where the two motion-compensated samples disagree the motion is wrong (usually an
++    // occlusion), so fall back to a plain blend there.
++    float bad = smoothstep(0.12, 0.35, maxComponent(abs(a - b)));
++    vec3 color = mix(mix(a, b, t), mix(a0, b0, t), bad);
++
++    // A pixel that is identical in both frames stays untouched. This keeps the HUD and text sharp.
++    float still = 1.0 - smoothstep(0.004, 0.02, maxComponent(abs(a0 - b0)));
++    color = mix(color, b0, still);
++
++    outColor = vec4(color, 1.0);
++}
+diff --git a/app/src/main/java/com/winlator/XServerDisplayActivity.java b/app/src/main/java/com/winlator/XServerDisplayActivity.java
+index 18acd68..d450491 100644
+--- a/app/src/main/java/com/winlator/XServerDisplayActivity.java
++++ b/app/src/main/java/com/winlator/XServerDisplayActivity.java
+@@ -66,6 +66,7 @@ import com.winlator.inputcontrols.ControlsProfile;
+ import com.winlator.inputcontrols.ExternalController;
+ import com.winlator.inputcontrols.InputControlsManager;
+ import com.winlator.math.Mathf;
++import com.winlator.renderer.FrameGenerator;
+ import com.winlator.renderer.GLRenderer;
+ import com.winlator.services.ForegroundService;
+ import com.winlator.widget.FrameRating;
+@@ -587,6 +588,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
+         renderer.setCursorColor(preferences.getInt("cursor_color", 0xffffff));
+         renderer.setCursorScale(preferences.getFloat("cursor_scale", 1.0f));
+         renderer.setForceWindowsFullscreen(shortcut != null && shortcut.getExtra("forceFullscreen", "0").equals("1"));
++        applyFrameGeneration(preferences.getInt("frame_generation", 1));
+ 
+         xServer.setRenderer(renderer);
+         rootView.addView(xServerView);
+@@ -1063,6 +1065,12 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
+         this.screenEffectProfile = screenEffectProfile;
+     }
+ 
++    /** @param multiplier 1 turns the frame generation off, 2..4 is the highest multiplier. */
++    public void applyFrameGeneration(int multiplier) {
++        xServerView.getRenderer().frameGenerator.setMaxMultiplier(multiplier);
++        FrameGenerator.requestHighestRefreshRate(this, multiplier >= 2);
++    }
++
+     private void changeWineAudioDriver() {
+         if (!audioDriver.equals(container.getExtra("audioDriver"))) {
+             File rootDir = rootFS.getRootDir();
+diff --git a/app/src/main/java/com/winlator/contentdialog/ScreenEffectDialog.java b/app/src/main/java/com/winlator/contentdialog/ScreenEffectDialog.java
+index 6287eb8..6a212c0 100644
+--- a/app/src/main/java/com/winlator/contentdialog/ScreenEffectDialog.java
++++ b/app/src/main/java/com/winlator/contentdialog/ScreenEffectDialog.java
+@@ -7,6 +7,7 @@ import android.widget.ArrayAdapter;
+ import android.widget.Button;
+ import android.widget.CheckBox;
+ import android.widget.Spinner;
++import android.widget.TextView;
+ 
+ import androidx.preference.PreferenceManager;
+ 
+@@ -32,6 +33,7 @@ public class ScreenEffectDialog extends ContentDialog {
+     private final SeekBar sbGamma;
+     private final CheckBox cbEnableFXAA;
+     private final CheckBox cbEnableCRTShader;
++    private final Spinner sFrameGeneration;
+ 
+     public ScreenEffectDialog(XServerDisplayActivity activity) {
+         super(activity, R.layout.screen_effect_dialog);
+@@ -60,6 +62,12 @@ public class ScreenEffectDialog extends ContentDialog {
+         cbEnableFXAA.setChecked(fxaaEffect != null);
+         cbEnableCRTShader.setChecked(crtEffect != null);
+ 
++        // The spinner position is the multiplier minus one: 0 = disabled, 1 = x2 and so on.
++        sFrameGeneration = findViewById(R.id.SFrameGeneration);
++        sFrameGeneration.setSelection(renderer.frameGenerator.getMaxMultiplier() - 1);
++        TextView tvFrameGenerationStatus = findViewById(R.id.TVFrameGenerationStatus);
++        tvFrameGenerationStatus.setText(activity.getString(R.string.frame_generation_hint)+" "+renderer.frameGenerator.getStatus());
++
+         sProfile.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+             @Override
+             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+@@ -110,6 +118,10 @@ public class ScreenEffectDialog extends ContentDialog {
+             }
+             else if (crtEffect != null) renderer.effectComposer.removeEffect(crtEffect);
+ 
++            int frameGenerationMultiplier = sFrameGeneration.getSelectedItemPosition() + 1;
++            preferences.edit().putInt("frame_generation", frameGenerationMultiplier).apply();
++            activity.applyFrameGeneration(frameGenerationMultiplier);
++
+             saveProfile(sProfile);
+         });
+ 
+@@ -125,6 +137,7 @@ public class ScreenEffectDialog extends ContentDialog {
+ 
+         cbEnableFXAA.setChecked(false);
+         cbEnableCRTShader.setChecked(false);
++        sFrameGeneration.setSelection(0);
+     }
+ 
+     private void saveProfile(Spinner sProfile) {
+diff --git a/app/src/main/java/com/winlator/renderer/EffectComposer.java b/app/src/main/java/com/winlator/renderer/EffectComposer.java
+index 79ea768..b9cb26f 100644
+--- a/app/src/main/java/com/winlator/renderer/EffectComposer.java
++++ b/app/src/main/java/com/winlator/renderer/EffectComposer.java
+@@ -74,13 +74,13 @@ public class EffectComposer {
+     public synchronized void render() {
+         initBuffers();
+ 
+-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, hasEffects() ? readBuffer.getFramebuffer() : 0);
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, hasEffects() ? readBuffer.getFramebuffer() : renderer.outputFramebuffer);
+         renderer.drawFrame();
+ 
+         for (Effect effect : effects) {
+             boolean renderToScreen = effect == effects.get(effects.size()-1);
+ 
+-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, !renderToScreen ? writeBuffer.getFramebuffer() : 0);
++            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, !renderToScreen ? writeBuffer.getFramebuffer() : renderer.outputFramebuffer);
+             GLES20.glViewport(0, 0, renderer.surfaceWidth, renderer.surfaceHeight);
+             renderer.viewportNeedsUpdate = true;
+             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+diff --git a/app/src/main/java/com/winlator/renderer/FrameGenerator.java b/app/src/main/java/com/winlator/renderer/FrameGenerator.java
+new file mode 100644
+index 0000000..c789f73
+--- /dev/null
++++ b/app/src/main/java/com/winlator/renderer/FrameGenerator.java
+@@ -0,0 +1,625 @@
++package com.winlator.renderer;
++
++import android.app.Activity;
++import android.content.Context;
++import android.opengl.GLES20;
++import android.os.Handler;
++import android.os.Looper;
++import android.util.Log;
++import android.view.Choreographer;
++import android.view.Display;
++import android.view.WindowManager;
++
++import com.winlator.xserver.ScreenInfo;
++import com.winlator.xserver.Window;
++
++import java.io.ByteArrayOutputStream;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.Locale;
++
++/**
++ * Motion-compensated frame generation for the X server output.
++ *
++ * While the game delivers frames at a steady rate that is at most half of the display refresh
++ * rate, the renderer stops drawing on demand and is driven by vsync ticks instead: for every new
++ * game frame it shows one or more in-between frames first and the real frame last. The in-between
++ * frames are built from a motion field estimated between the two latest game frames.
++ *
++ * When the cadence is not suitable (game too fast, too slow or irregular) the renderer keeps its
++ * original code path untouched and this class only measures the cadence.
++ */
++public class FrameGenerator implements Choreographer.FrameCallback {
++    private static final String TAG = "FrameGenerator";
++
++    public static final byte QUALITY_FAST = 0;
++    public static final byte QUALITY_BALANCED = 1;
++    public static final byte QUALITY_HIGH = 2;
++
++    private static final int MAX_MULTIPLIER = 4;
++    private static final long MAX_SOURCE_INTERVAL_NS = 70000000L;   // below ~14 FPS nothing is generated
++    private static final long CADENCE_RESET_NS = 100000000L;
++    private static final long IDLE_TIMEOUT_NS = 300000000L;
++    private static final long TICK_TIMEOUT_NS = 100000000L;
++    private static final int START_STEADY_FRAMES = 8;
++    private static final int CALIBRATION_SAMPLES = 5;
++
++    // {propagate, step, lodOffset} for the passes that run after the three pyramid levels
++    private static final float[][][] REFINE_PASSES = {
++        {{0, 0.5f, 0}},
++        {{1, 1.0f, 0}, {0, 0.5f, 0}, {1, 1.0f, 0}},
++        {{1, 1.0f, 0}, {0, 0.5f, 0}, {1, 1.0f, 0}, {0, 0.25f, -1}, {1, 1.0f, -1}},
++    };
++
++    private final GLRenderer renderer;
++    private final Handler mainHandler = new Handler(Looper.getMainLooper());
++
++    private volatile int maxMultiplier = 1;
++    private volatile boolean failed = false;
++
++    // cadence of the game frames, written by the X server thread
++    private volatile boolean contentDirty = false;
++    private volatile long lastContentNs = 0;
++    private volatile long intervalNs = 0;
++    private volatile int steadyFrames = 0;
++
++    // pacing, ticks come from Choreographer on the main thread
++    private volatile boolean pacing = false;
++    private volatile boolean sequenceActive = false;
++    private volatile int tickCount = 0;
++    private volatile long lastTickNs = 0;
++    private volatile long refreshPeriodNs = 16666667L;
++    private boolean callbackScheduled = false;
++
++    // everything below belongs to the render thread
++    private int handledTick = 0;
++    private int sequenceCount = 0;
++    private int sequenceIndex = 0;
++    private int spacing = 1;
++    private int ticksLeft = 0;
++    private float lastT = 1.0f;
++    private int directDraws = 0;
++
++    private int width = 0;
++    private int height = 0;
++    private int baseLod = 3;
++    private final int[] frameTextures = new int[2];
++    private final int[] frameFramebuffers = new int[2];
++    private int current = 0;
++    private int frames = 0;
++    private final int[] flowTextures = new int[5];      // three pyramid levels and two spares
++    private final int[] flowFramebuffers = new int[5];
++    private final int[] flowWidths = new int[5];
++    private final int[] flowHeights = new int[5];
++    private int finalFlow = 0;
++    private boolean resourcesReady = false;
++
++    private int flowProgram = 0;
++    private int warpProgram = 0;
++    private int blitProgram = 0;
++    private final int[] flowUniforms = new int[9];
++    private final int[] warpUniforms = new int[5];
++    private int blitFrameUniform = -1;
++
++    private volatile byte quality = QUALITY_HIGH;
++    private boolean calibrated = false;
++    private int calibrationSamples = 0;
++    private long calibrationSumNs = 0;
++    private volatile float lastCostMs = 0;
++    private volatile int activeMultiplier = 1;
++
++    public FrameGenerator(GLRenderer renderer) {
++        this.renderer = renderer;
++    }
++
++    // ---------------------------------------------------------------- settings (any thread)
++
++    /** 1 turns the generation off, 2..4 is the highest number of shown frames per game frame. */
++    public void setMaxMultiplier(int maxMultiplier) {
++        this.maxMultiplier = Math.max(1, Math.min(MAX_MULTIPLIER, maxMultiplier));
++        steadyFrames = 0;
++        updateRefreshPeriod();
++        if (this.maxMultiplier < 2) stopPacing();
++    }
++
++    public int getMaxMultiplier() {
++        return maxMultiplier;
++    }
++
++    public boolean isPacing() {
++        return pacing;
++    }
++
++    /** Asks the system for the fastest refresh rate of the current resolution (or releases it). */
++    public static void requestHighestRefreshRate(Activity activity, boolean enable) {
++        try {
++            android.view.Window window = activity.getWindow();
++            Display display = activity.getWindowManager().getDefaultDisplay();
++            Display.Mode currentMode = display.getMode();
++            Display.Mode bestMode = currentMode;
++            for (Display.Mode mode : display.getSupportedModes()) {
++                boolean sameSize = mode.getPhysicalWidth() == currentMode.getPhysicalWidth() && mode.getPhysicalHeight() == currentMode.getPhysicalHeight();
++                if (sameSize && mode.getRefreshRate() > bestMode.getRefreshRate()) bestMode = mode;
++            }
++
++            WindowManager.LayoutParams params = window.getAttributes();
++            params.preferredDisplayModeId = enable ? bestMode.getModeId() : 0;
++            window.setAttributes(params);
++        }
++        catch (RuntimeException e) {
++            Log.w(TAG, "Unable to change the display mode", e);
++        }
++    }
++
++    /** One line for the settings dialog, so the user can see what the generator is doing. */
++    public String getStatus() {
++        long period = refreshPeriodNs;
++        long interval = intervalNs;
++        String screen = String.format(Locale.ENGLISH, "%.0f Hz", 1.0e9 / period);
++        String game = interval > 0 ? String.format(Locale.ENGLISH, "%.0f FPS", 1.0e9 / interval) : "-";
++        if (failed) return "error | " + screen;
++        if (maxMultiplier < 2) return "off | " + screen + " | " + game;
++        if (!pacing) return "waiting | " + screen + " | " + game;
++        String[] qualities = {"fast", "balanced", "high"};
++        return String.format(Locale.ENGLISH, "x%d | %s | %s | %.1f ms | %s", activeMultiplier, screen, game, lastCostMs, qualities[quality]);
++    }
++
++    // ---------------------------------------------------------------- X server thread
++
++    /**
++     * Called for every content update of a window.
++     * @return true when the frame will be picked up by the next vsync tick and no render request is needed.
++     */
++    public boolean onContentUpdate(Window window, ScreenInfo screenInfo) {
++        if (maxMultiplier < 2 || failed) return false;
++
++        // Only a large window is treated as the game picture, small ones just need a redraw.
++        boolean large = window.getWidth() * window.getHeight() * 4 >= screenInfo.width * screenInfo.height;
++        long now = System.nanoTime();
++        if (large) {
++            long last = lastContentNs;
++            lastContentNs = now;
++            if (last != 0) {
++                long delta = now - last;
++                if (delta < CADENCE_RESET_NS) {
++                    long interval = intervalNs;
++                    interval = interval == 0 ? delta : (interval * 7 + delta) / 8;
++                    intervalNs = interval;
++                    steadyFrames = multiplierFor(interval) >= 2 ? Math.min(steadyFrames + 1, 1000) : 0;
++                }
++                else {
++                    intervalNs = 0;
++                    steadyFrames = 0;
++                }
++            }
++        }
++        contentDirty = true;
++
++        if (pacing) {
++            // Safety net: if the vsync ticks stopped for any reason, go back to drawing on demand.
++            if (now - lastTickNs > TICK_TIMEOUT_NS) {
++                pacing = false;
++                sequenceActive = false;
++                return false;
++            }
++            return true;
++        }
++        return false;
++    }
++
++    // ---------------------------------------------------------------- main thread
++
++    @Override
++    public void doFrame(long frameTimeNanos) {
++        callbackScheduled = false;
++        if (!pacing) return;
++
++        long now = System.nanoTime();
++        lastTickNs = now;
++        if (maxMultiplier < 2 || now - lastContentNs > IDLE_TIMEOUT_NS) {
++            stopPacing();
++            return;
++        }
++
++        if (contentDirty || sequenceActive) {
++            tickCount++;
++            renderer.xServerView.requestRender();
++        }
++
++        callbackScheduled = true;
++        Choreographer.getInstance().postFrameCallback(this);
++    }
++
++    private void stopPacing() {
++        if (!pacing) return;
++        pacing = false;
++        sequenceActive = false;
++        renderer.xServerView.requestRender();
++    }
++
++    // ---------------------------------------------------------------- render thread
++
++    /** The GL context was recreated, every object id is gone. */
++    public void onContextCreated() {
++        resourcesReady = false;
++        flowProgram = warpProgram = blitProgram = 0;
++        frameTextures[0] = frameTextures[1] = 0;
++        width = height = 0;
++        frames = 0;
++        pacing = false;
++        sequenceActive = false;
++    }
++
++    /** Called after a frame was drawn the ordinary way. Decides when to take over. */
++    public void afterDirectDraw() {
++        if (maxMultiplier < 2 || failed || pacing) return;
++        if ((directDraws++ & 63) == 0) updateRefreshPeriod();
++        if (steadyFrames < START_STEADY_FRAMES) return;
++
++        frames = 0;
++        sequenceActive = false;
++        handledTick = tickCount;
++        lastTickNs = System.nanoTime();
++        pacing = true;
++        mainHandler.post(() -> {
++            if (!callbackScheduled) {
++                callbackScheduled = true;
++                Choreographer.getInstance().postFrameCallback(this);
++            }
++        });
++    }
++
++    /**
++     * Draws one output frame in paced mode.
++     * @return false when the generator cannot work and the caller must draw the ordinary way.
++     */
++    public boolean drawPaced() {
++        if (!ensureResources(renderer.surfaceWidth, renderer.surfaceHeight)) {
++            failed = true;
++            pacing = false;
++            sequenceActive = false;
++            return false;
++        }
++
++        int tick = tickCount;
++        boolean isTick = tick != handledTick;
++        handledTick = tick;
++
++        if (frames == 0) {
++            // first frame after taking over: there is nothing to interpolate from yet
++            if (isTick) contentDirty = false;
++            capture();
++            lastT = 1.0f;
++        }
++        else if (isTick) {
++            if (sequenceActive) {
++                if (--ticksLeft <= 0) {
++                    if (sequenceIndex >= sequenceCount) {
++                        lastT = 1.0f;
++                        sequenceActive = false;
++                    }
++                    else {
++                        lastT = sequenceIndex / (float)sequenceCount;
++                        sequenceIndex++;
++                        ticksLeft = spacing;
++                    }
++                }
++            }
++            else if (contentDirty) {
++                contentDirty = false;
++                capture();
++
++                long interval = intervalNs;
++                int multiplier = multiplierFor(interval);
++                if (frames >= 2 && multiplier >= 2 && steadyFrames > 0) {
++                    long startTime = !calibrated ? System.nanoTime() : 0;
++                    computeFlow();
++
++                    sequenceCount = multiplier;
++                    sequenceIndex = 2;
++                    spacing = spacingFor(interval, multiplier);
++                    ticksLeft = spacing;
++                    lastT = 1.0f / multiplier;
++                    activeMultiplier = multiplier;
++                    sequenceActive = true;
++
++                    present(lastT);
++                    if (!calibrated) calibrate(startTime);
++                    renderer.renderCursorOverlay();
++                    return true;
++                }
++                else {
++                    lastT = 1.0f;
++                    if (multiplier < 2 || steadyFrames == 0) pacing = false;
++                }
++            }
++        }
++
++        present(lastT);
++        renderer.renderCursorOverlay();
++        return true;
++    }
++
++    /** Lowers the quality when building a frame takes more than half of a refresh period. */
++    private void calibrate(long startTime) {
++        GLES20.glFinish();
++        long elapsed = System.nanoTime() - startTime;
++        // the first sample includes shader warm-up and is ignored
++        if (calibrationSamples++ > 0) calibrationSumNs += elapsed;
++        if (calibrationSamples <= CALIBRATION_SAMPLES) return;
++
++        long average = calibrationSumNs / (calibrationSamples - 1);
++        lastCostMs = average / 1000000.0f;
++        calibrationSamples = 0;
++        calibrationSumNs = 0;
++
++        if (average > refreshPeriodNs / 2 && quality > QUALITY_FAST) {
++            quality--;
++        }
++        else calibrated = true;
++    }
++
++    private void updateRefreshPeriod() {
++        Display display = renderer.xServerView.getDisplay();
++        if (display != null) {
++            float refreshRate = display.getRefreshRate();
++            if (refreshRate >= 30.0f) refreshPeriodNs = (long)(1.0e9 / refreshRate);
++        }
++    }
++
++    /** How many frames can be shown per game frame: the game must take at least ~2 refresh periods. */
++    private int multiplierFor(long interval) {
++        if (interval <= 0 || interval > MAX_SOURCE_INTERVAL_NS) return 1;
++        int periods = (int)Math.floor(interval / (double)refreshPeriodNs + 0.1);
++        return Math.max(1, Math.min(maxMultiplier, periods));
++    }
++
++    private int spacingFor(long interval, int multiplier) {
++        return Math.max(1, (int)Math.floor(interval / (double)refreshPeriodNs / multiplier + 0.1));
++    }
++
++    private void capture() {
++        int next = 1 - current;
++        renderer.renderSceneTo(frameFramebuffers[next]);
++        current = next;
++        if (frames < 2) frames++;
++
++        // The motion search reads the lower mip levels of the frame.
++        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
++        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frameTextures[current]);
++        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
++        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
++    }
++
++    private void computeFlow() {
++        GLES20.glDisable(GLES20.GL_BLEND);
++        GLES20.glUseProgram(flowProgram);
++        bindTexture(0, frameTextures[1 - current]);
++        bindTexture(1, frameTextures[current]);
++        GLES20.glUniform1i(flowUniforms[0], 0);
++        GLES20.glUniform1i(flowUniforms[1], 1);
++        GLES20.glUniform1i(flowUniforms[2], 2);
++
++        flowPass(2, -1, 0.0f, 4, 1.0f, baseLod + 2, false);
++        flowPass(1, 2, 2.0f, 1, 1.0f, baseLod + 1, false);
++        flowPass(0, 1, 2.0f, 1, 1.0f, baseLod, false);
++
++        int source = 0;
++        int spare = 3;
++        for (float[] pass : REFINE_PASSES[quality]) {
++            flowPass(spare, source, 1.0f, 1, pass[1], Math.max(0, baseLod + (int)pass[2]), pass[0] != 0);
++            source = spare;
++            spare = spare == 3 ? 4 : 3;
++        }
++        finalFlow = source;
++
++        unbindTextures();
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
++        GLES20.glEnable(GLES20.GL_BLEND);
++        renderer.viewportNeedsUpdate = true;
++    }
++
++    private void flowPass(int target, int coarse, float coarseScale, int radius, float stepSize, int lod, boolean propagate) {
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, flowFramebuffers[target]);
++        GLES20.glViewport(0, 0, flowWidths[target], flowHeights[target]);
++        // without a coarser level the sampler still needs a valid texture
++        bindTexture(2, coarse >= 0 ? flowTextures[coarse] : frameTextures[current]);
++        GLES20.glUniform1f(flowUniforms[3], lod);
++        GLES20.glUniform2f(flowUniforms[4], 1.0f / flowWidths[target], 1.0f / flowHeights[target]);
++        GLES20.glUniform1f(flowUniforms[5], coarseScale);
++        GLES20.glUniform1i(flowUniforms[6], radius);
++        GLES20.glUniform1f(flowUniforms[7], stepSize);
++        GLES20.glUniform1i(flowUniforms[8], propagate ? 1 : 0);
++        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 3);
++    }
++
++    /** Shows the newest game frame (t = 1) or an in-between frame (0 < t < 1). */
++    private void present(float t) {
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
++        GLES20.glViewport(0, 0, width, height);
++        GLES20.glDisable(GLES20.GL_BLEND);
++
++        if (t >= 1.0f || frames < 2) {
++            GLES20.glUseProgram(blitProgram);
++            bindTexture(0, frameTextures[current]);
++            GLES20.glUniform1i(blitFrameUniform, 0);
++        }
++        else {
++            GLES20.glUseProgram(warpProgram);
++            bindTexture(0, frameTextures[1 - current]);
++            bindTexture(1, frameTextures[current]);
++            bindTexture(2, flowTextures[finalFlow]);
++            GLES20.glUniform1i(warpUniforms[0], 0);
++            GLES20.glUniform1i(warpUniforms[1], 1);
++            GLES20.glUniform1i(warpUniforms[2], 2);
++            GLES20.glUniform2f(warpUniforms[3], 1.0f / flowWidths[finalFlow], 1.0f / flowHeights[finalFlow]);
++            GLES20.glUniform1f(warpUniforms[4], t);
++        }
++        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 3);
++
++        unbindTextures();
++        GLES20.glEnable(GLES20.GL_BLEND);
++        renderer.viewportNeedsUpdate = true;
++    }
++
++    private static void bindTexture(int unit, int textureId) {
++        GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + unit);
++        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
++    }
++
++    private static void unbindTextures() {
++        for (int unit = 2; unit >= 0; unit--) bindTexture(unit, 0);
++    }
++
++    // ---------------------------------------------------------------- GL resources
++
++    private boolean ensureResources(int surfaceWidth, int surfaceHeight) {
++        if (surfaceWidth <= 0 || surfaceHeight <= 0) return false;
++        if (resourcesReady && surfaceWidth == width && surfaceHeight == height) return true;
++
++        try {
++            if (flowProgram == 0) createPrograms();
++            destroyTargets();
++            createTargets(surfaceWidth, surfaceHeight);
++        }
++        catch (RuntimeException e) {
++            Log.e(TAG, "Frame generation is unavailable", e);
++            resourcesReady = false;
++            return false;
++        }
++
++        width = surfaceWidth;
++        height = surfaceHeight;
++        frames = 0;
++        current = 0;
++        sequenceActive = false;
++        calibrated = false;
++        calibrationSamples = 0;
++        calibrationSumNs = 0;
++        resourcesReady = true;
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
++        renderer.viewportNeedsUpdate = true;
++        return true;
++    }
++
++    private void createPrograms() {
++        Context context = renderer.xServerView.getContext();
++        String vertexShader = readAsset(context, "framegen/fullscreen.vert");
++
++        flowProgram = linkProgram(vertexShader, readAsset(context, "framegen/flow.frag"));
++        String[] flowNames = {"frameA", "frameB", "coarseFlow", "lod", "texel", "coarseScale", "radius", "stepSize", "propagate"};
++        for (int i = 0; i < flowNames.length; i++) flowUniforms[i] = GLES20.glGetUniformLocation(flowProgram, flowNames[i]);
++
++        warpProgram = linkProgram(vertexShader, readAsset(context, "framegen/warp.frag"));
++        String[] warpNames = {"frameA", "frameB", "flow", "flowTexel", "t"};
++        for (int i = 0; i < warpNames.length; i++) warpUniforms[i] = GLES20.glGetUniformLocation(warpProgram, warpNames[i]);
++
++        blitProgram = linkProgram(vertexShader, readAsset(context, "framegen/blit.frag"));
++        blitFrameUniform = GLES20.glGetUniformLocation(blitProgram, "frame");
++    }
++
++    private void createTargets(int surfaceWidth, int surfaceHeight) {
++        // One flow texel covers 8 pixels, or 16 on large surfaces to keep the search affordable.
++        baseLod = surfaceWidth > 1600 ? 4 : 3;
++        int baseSize = 1 << baseLod;
++
++        GLES20.glGenTextures(2, frameTextures, 0);
++        GLES20.glGenFramebuffers(2, frameFramebuffers, 0);
++        for (int i = 0; i < 2; i++) {
++            allocateTexture(frameTextures[i], surfaceWidth, surfaceHeight, GLES20.GL_LINEAR_MIPMAP_NEAREST);
++            GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D);
++            attachTexture(frameFramebuffers[i], frameTextures[i]);
++            GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
++            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
++        }
++
++        GLES20.glGenTextures(5, flowTextures, 0);
++        GLES20.glGenFramebuffers(5, flowFramebuffers, 0);
++        for (int i = 0; i < 5; i++) {
++            int level = i < 3 ? i : 0;
++            flowWidths[i] = (int)Math.ceil(surfaceWidth / (double)(baseSize << level));
++            flowHeights[i] = (int)Math.ceil(surfaceHeight / (double)(baseSize << level));
++            allocateTexture(flowTextures[i], flowWidths[i], flowHeights[i], GLES20.GL_LINEAR);
++            attachTexture(flowFramebuffers[i], flowTextures[i]);
++        }
++
++        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0);
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
++    }
++
++    private void destroyTargets() {
++        if (frameTextures[0] == 0) return;
++        GLES20.glDeleteFramebuffers(2, frameFramebuffers, 0);
++        GLES20.glDeleteTextures(2, frameTextures, 0);
++        GLES20.glDeleteFramebuffers(5, flowFramebuffers, 0);
++        GLES20.glDeleteTextures(5, flowTextures, 0);
++        frameTextures[0] = frameTextures[1] = 0;
++    }
++
++    private static void allocateTexture(int textureId, int textureWidth, int textureHeight, int minFilter) {
++        GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
++        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId);
++        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, textureWidth, textureHeight, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
++        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, minFilter);
++        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
++        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
++        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
++    }
++
++    private static void attachTexture(int framebuffer, int textureId) {
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, framebuffer);
++        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, textureId, 0);
++        int status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER);
++        if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
++            throw new RuntimeException("Incomplete framebuffer: 0x" + Integer.toHexString(status));
++        }
++    }
++
++    private static int linkProgram(String vertexShader, String fragmentShader) {
++        int programId = GLES20.glCreateProgram();
++        int vertexShaderId = compileShader(GLES20.GL_VERTEX_SHADER, vertexShader);
++        int fragmentShaderId = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentShader);
++        GLES20.glAttachShader(programId, vertexShaderId);
++        GLES20.glAttachShader(programId, fragmentShaderId);
++        GLES20.glLinkProgram(programId);
++        GLES20.glDeleteShader(vertexShaderId);
++        GLES20.glDeleteShader(fragmentShaderId);
++
++        int[] linked = new int[1];
++        GLES20.glGetProgramiv(programId, GLES20.GL_LINK_STATUS, linked, 0);
++        if (linked[0] == 0) {
++            String message = GLES20.glGetProgramInfoLog(programId);
++            GLES20.glDeleteProgram(programId);
++            throw new RuntimeException("Could not link program: " + message);
++        }
++        return programId;
++    }
++
++    private static int compileShader(int type, String source) {
++        int shaderId = GLES20.glCreateShader(type);
++        GLES20.glShaderSource(shaderId, source);
++        GLES20.glCompileShader(shaderId);
++
++        int[] compiled = new int[1];
++        GLES20.glGetShaderiv(shaderId, GLES20.GL_COMPILE_STATUS, compiled, 0);
++        if (compiled[0] == 0) {
++            String message = GLES20.glGetShaderInfoLog(shaderId);
++            GLES20.glDeleteShader(shaderId);
++            throw new RuntimeException("Could not compile shader: " + message);
++        }
++        return shaderId;
++    }
++
++    private static String readAsset(Context context, String path) {
++        try (InputStream inputStream = context.getAssets().open(path)) {
++            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
++            byte[] buffer = new byte[4096];
++            int length;
++            while ((length = inputStream.read(buffer)) != -1) outputStream.write(buffer, 0, length);
++            return new String(outputStream.toByteArray(), StandardCharsets.UTF_8);
++        }
++        catch (java.io.IOException e) {
++            throw new RuntimeException("Missing asset: " + path, e);
++        }
++    }
++}
+diff --git a/app/src/main/java/com/winlator/renderer/GLRenderer.java b/app/src/main/java/com/winlator/renderer/GLRenderer.java
+index b144c9f..9b25d55 100644
+--- a/app/src/main/java/com/winlator/renderer/GLRenderer.java
++++ b/app/src/main/java/com/winlator/renderer/GLRenderer.java
+@@ -63,6 +63,9 @@ public class GLRenderer implements GLSurfaceView.Renderer, WindowManager.OnWindo
+     protected short surfaceWidth;
+     protected short surfaceHeight;
+     public final EffectComposer effectComposer = new EffectComposer(this);
++    public final FrameGenerator frameGenerator = new FrameGenerator(this);
++    protected int outputFramebuffer = 0;
++    private boolean sceneOnly = false;
+ 
+     public GLRenderer(XServerView xServerView, XServer xServer) {
+         this.xServerView = xServerView;
+@@ -95,6 +98,7 @@ public class GLRenderer implements GLSurfaceView.Renderer, WindowManager.OnWindo
+         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+ 
+         EGL14.eglSwapInterval(EGL14.eglGetCurrentDisplay(), 0);
++        frameGenerator.onContextCreated();
+     }
+ 
+     @Override
+@@ -113,10 +117,46 @@ public class GLRenderer implements GLSurfaceView.Renderer, WindowManager.OnWindo
+             viewportNeedsUpdate = true;
+         }
+ 
++        // While frames are being generated the generator decides what is shown on every vsync.
++        if (frameGenerator.isPacing() && frameGenerator.drawPaced()) return;
++
+         if (effectComposer.hasEffects()) {
+             effectComposer.render();
+         }
+         else drawFrame();
++
++        frameGenerator.afterDirectDraw();
++    }
++
++    /** Draws the windows (with the screen effects, without the cursor) into the given framebuffer. */
++    void renderSceneTo(int framebuffer) {
++        outputFramebuffer = framebuffer;
++        sceneOnly = true;
++        viewportNeedsUpdate = true;
++
++        if (effectComposer.hasEffects()) {
++            effectComposer.render();
++        }
++        else {
++            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, framebuffer);
++            drawFrame();
++        }
++
++        outputFramebuffer = 0;
++        sceneOnly = false;
++        viewportNeedsUpdate = true;
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
++    }
++
++    /** Draws only the cursor over whatever is already in the default framebuffer. */
++    void renderCursorOverlay() {
++        if (!cursorVisible) return;
++        if (fullscreen) {
++            GLES20.glViewport(0, 0, surfaceWidth, surfaceHeight);
++        }
++        else GLES20.glViewport(viewTransformation.viewOffsetX, viewTransformation.viewOffsetY, viewTransformation.viewWidth, viewTransformation.viewHeight);
++        viewportNeedsUpdate = true;
++        renderCursor();
+     }
+ 
+     protected void drawFrame() {
+@@ -147,7 +187,7 @@ public class GLRenderer implements GLSurfaceView.Renderer, WindowManager.OnWindo
+         XForm.makeTransform(tmpXForm2, -pointerX, -pointerY, magnifierZoom, magnifierZoom, 0);
+ 
+         renderWindows();
+-        if (cursorVisible) renderCursor();
++        if (cursorVisible && !sceneOnly) renderCursor();
+     }
+ 
+     @Override
+@@ -170,6 +210,8 @@ public class GLRenderer implements GLSurfaceView.Renderer, WindowManager.OnWindo
+ 
+     @Override
+     public void onUpdateWindowContent(Window window) {
++        // In paced mode the new frame is picked up by the next vsync tick.
++        if (frameGenerator.onContentUpdate(window, xServer.screenInfo)) return;
+         xServerView.requestRender();
+     }
+ 
+diff --git a/app/src/main/res/layout/screen_effect_dialog.xml b/app/src/main/res/layout/screen_effect_dialog.xml
+index 6113d5e..b289d9a 100644
+--- a/app/src/main/res/layout/screen_effect_dialog.xml
++++ b/app/src/main/res/layout/screen_effect_dialog.xml
+@@ -118,6 +118,26 @@
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+                 android:text="@string/enable_crt_shader" />
++
++            <TextView
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_marginTop="8dp"
++                android:text="@string/frame_generation" />
++
++            <Spinner
++                style="@style/ComboBox"
++                android:id="@+id/SFrameGeneration"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:entries="@array/frame_generation_entries" />
++
++            <TextView
++                android:id="@+id/TVFrameGenerationStatus"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginTop="4dp"
++                android:textSize="12sp" />
+         </LinearLayout>
+     </LinearLayout>
+ </LinearLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
+index 4a9e63f..e373dc7 100644
+--- a/app/src/main/res/values-pt/strings.xml
++++ b/app/src/main/res/values-pt/strings.xml
+@@ -302,4 +302,6 @@
+     <string name="add_to_home_screen">Adicionar à Tela Inicial</string>
+     <string name="home_screen_shortcuts_not_supported">Sua tela inicial não oferece suporte à adição de ícones</string>
+     <string name="unable_to_launch_from_home_screen">Não foi possível iniciar: o arquivo ou o contêiner não foi encontrado</string>
++    <string name="frame_generation">Geração de Quadros</string>
++    <string name="frame_generation_hint">Funciona quando o jogo roda na metade da taxa de atualização da tela ou menos; limite a taxa de quadros nas configurações do DXVK. Estado atual:</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 2362fb2..69cb353 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -302,4 +302,6 @@
+     <string name="add_to_home_screen">Добавить на главный экран</string>
+     <string name="home_screen_shortcuts_not_supported">Главный экран не поддерживает добавление значков</string>
+     <string name="unable_to_launch_from_home_screen">Не удалось запустить: файл или его контейнер не найден</string>
++    <string name="frame_generation">Генерация кадров</string>
++    <string name="frame_generation_hint">Работает, когда игра выдаёт не больше половины частоты экрана, поэтому ограничьте её частоту кадров в настройках DXVK. Состояние сейчас:</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/arrays.xml b/app/src/main/res/values/arrays.xml
+index b9b92c9..283344c 100644
+--- a/app/src/main/res/values/arrays.xml
++++ b/app/src/main/res/values/arrays.xml
+@@ -159,4 +159,10 @@
+         <item>mailbox</item>
+         <item>fifo</item>
+     </string-array>
++    <string-array name="frame_generation_entries">
++        <item>@string/disabled</item>
++        <item>x2</item>
++        <item>x3</item>
++        <item>x4</item>
++    </string-array>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4e34788..1dd54af 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -362,4 +362,6 @@
+     <string name="add_to_home_screen">Add to Home Screen</string>
+     <string name="home_screen_shortcuts_not_supported">Your home screen does not support adding icons</string>
+     <string name="unable_to_launch_from_home_screen">Unable to launch: the file or its container was not found</string>
++    <string name="frame_generation">Frame Generation</string>
++    <string name="frame_generation_hint">Works when the game runs at half the screen refresh rate or lower, so limit its frame rate in the DXVK settings. Current state:</string>
+ </resources>
