@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FrameGen Mobile</string>
+    <string name="acc_label">FrameGen: окно поверх игры</string>
+    <string name="acc_desc">Нужна только для того, чтобы окно с кадрами пропускало касания в игру. Служба не читает содержимое экрана и не получает события.</string>
+</resources>
