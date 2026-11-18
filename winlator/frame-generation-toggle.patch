@@ -1,0 +1,115 @@
+diff --git a/app/src/main/java/com/winlator/XServerDisplayActivity.java b/app/src/main/java/com/winlator/XServerDisplayActivity.java
+index d450491..69a5659 100644
+--- a/app/src/main/java/com/winlator/XServerDisplayActivity.java
++++ b/app/src/main/java/com/winlator/XServerDisplayActivity.java
+@@ -9,6 +9,7 @@ import android.content.Intent;
+ import android.content.SharedPreferences;
+ import android.content.res.Configuration;
+ import android.os.Bundle;
++import android.view.Display;
+ import android.view.KeyEvent;
+ import android.view.Menu;
+ import android.view.MenuItem;
+@@ -370,6 +371,14 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
+                 showInputControlsDialog();
+                 drawerLayout.closeDrawers();
+                 break;
++            case R.id.menu_item_frame_generation: {
++                // One tap switches to the next mode: off, x2, x3, x4.
++                int multiplier = renderer.frameGenerator.getMaxMultiplier() % 4 + 1;
++                preferences.edit().putInt("frame_generation", multiplier).apply();
++                applyFrameGeneration(multiplier);
++                if (multiplier >= 2) AppUtils.showToast(this, R.string.frame_generation_restart_hint);
++                break;
++            }
+             case R.id.menu_item_toggle_fullscreen:
+                 renderer.toggleFullscreen();
+                 drawerLayout.closeDrawers();
+@@ -810,6 +819,7 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
+     private boolean extractDXWrapperFiles() {
+         String cacheId = "";
+         if (dxwrapper.equals(DXWrappers.DXVK)) {
++            applyFrameGenerationLimit(dxwrapperConfig[0]);
+             DXVKConfigDialog.setEnvVars(this, dxwrapperConfig[0], envVars);
+             cacheId += dxwrapper+"-"+dxwrapperConfig[0].get("version", DefaultVersion.DXVK(graphicsDriver[0]));
+         }
+@@ -1069,6 +1079,35 @@ public class XServerDisplayActivity extends AppCompatActivity implements Navigat
+     public void applyFrameGeneration(int multiplier) {
+         xServerView.getRenderer().frameGenerator.setMaxMultiplier(multiplier);
+         FrameGenerator.requestHighestRefreshRate(this, multiplier >= 2);
++        updateFrameGenerationMenuItem(multiplier);
++    }
++
++    private void updateFrameGenerationMenuItem(int multiplier) {
++        NavigationView navigationView = findViewById(R.id.NavigationView);
++        if (navigationView == null) return;
++        MenuItem menuItem = navigationView.getMenu().findItem(R.id.menu_item_frame_generation);
++        if (menuItem == null) return;
++        String state = multiplier >= 2 ? "x"+multiplier : getString(R.string.disabled);
++        menuItem.setTitle(getString(R.string.frame_generation)+": "+state);
++    }
++
++    /**
++     * Frames can only be generated when the game runs at the refresh rate divided by the multiplier,
++     * so that limit is set automatically unless the user chose a limit of their own.
++     */
++    private void applyFrameGenerationLimit(KeyValueSet config) {
++        int multiplier = preferences.getInt("frame_generation", 1);
++        String framerate = config.get("framerate");
++        if (multiplier < 2 || !(framerate.isEmpty() || framerate.equals("0"))) return;
++
++        float refreshRate = 60.0f;
++        Display display = getWindowManager().getDefaultDisplay();
++        Display.Mode currentMode = display.getMode();
++        for (Display.Mode mode : display.getSupportedModes()) {
++            boolean sameSize = mode.getPhysicalWidth() == currentMode.getPhysicalWidth() && mode.getPhysicalHeight() == currentMode.getPhysicalHeight();
++            if (sameSize) refreshRate = Math.max(refreshRate, mode.getRefreshRate());
++        }
++        config.put("framerate", Math.round(refreshRate / multiplier));
+     }
+ 
+     private void changeWineAudioDriver() {
+diff --git a/app/src/main/res/menu/xserver_menu.xml b/app/src/main/res/menu/xserver_menu.xml
+index 81fd492..bf85499 100644
+--- a/app/src/main/res/menu/xserver_menu.xml
++++ b/app/src/main/res/menu/xserver_menu.xml
+@@ -9,6 +9,7 @@
+         <item android:icon="@drawable/icon_active_windows" android:id="@+id/menu_item_active_windows" android:title="@string/active_windows" />
+         <item android:icon="@drawable/icon_magnifier" android:id="@+id/menu_item_magnifier" android:title="@string/magnifier" />
+         <item android:icon="@drawable/icon_screen_effect" android:id="@+id/menu_item_screen_effect" android:title="@string/screen_effect" />
++        <item android:icon="@drawable/icon_screen_effect" android:id="@+id/menu_item_frame_generation" android:title="@string/frame_generation" />
+         <item android:icon="@drawable/icon_pip_mode" android:id="@+id/menu_item_pip_mode" android:title="@string/pip_mode" />
+         <item android:icon="@drawable/icon_debug" android:id="@+id/menu_item_logs" android:title="@string/logs" />
+         <item android:icon="@drawable/icon_help" android:id="@+id/menu_item_touchpad_help" android:title="@string/touchpad_help" />
+diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
+index 1bb26f8..3512a02 100644
+--- a/app/src/main/res/values-pt/strings.xml
++++ b/app/src/main/res/values-pt/strings.xml
+@@ -307,4 +307,5 @@
+     <string name="quick_start">Executar um jogo ou instalador</string>
+     <string name="quick_start_hint">Abra a pasta do jogo e toque em setup.exe ou no arquivo do jogo (.exe)</string>
+     <string name="unable_to_create_container">Não foi possível criar o contêiner</string>
++    <string name="frame_generation_restart_hint">O limite de quadros para o novo modo será aplicado na próxima vez que o jogo for iniciado</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 196627b..a7e51eb 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -307,4 +307,5 @@
+     <string name="quick_start">Запустить игру или установщик</string>
+     <string name="quick_start_hint">Откройте папку с игрой и нажмите на setup.exe или на файл игры (.exe)</string>
+     <string name="unable_to_create_container">Не удалось создать контейнер</string>
++    <string name="frame_generation_restart_hint">Ограничение частоты кадров под новый режим применится при следующем запуске игры</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c205f31..0afb97f 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -367,4 +367,5 @@
+     <string name="quick_start">Run a game or an installer</string>
+     <string name="quick_start_hint">Open the game folder and tap setup.exe or the game file (.exe)</string>
+     <string name="unable_to_create_container">Unable to create the container</string>
++    <string name="frame_generation_restart_hint">The frame rate limit for the new mode takes effect the next time the game is started</string>
+ </resources>
