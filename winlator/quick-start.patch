@@ -1,0 +1,133 @@
+diff --git a/app/src/main/java/com/winlator/ContainersFragment.java b/app/src/main/java/com/winlator/ContainersFragment.java
+index aab4c0a..a2b4e25 100644
+--- a/app/src/main/java/com/winlator/ContainersFragment.java
++++ b/app/src/main/java/com/winlator/ContainersFragment.java
+@@ -30,9 +30,13 @@ import com.winlator.container.Container;
+ import com.winlator.container.ContainerManager;
+ import com.winlator.contentdialog.ContentDialog;
+ import com.winlator.contentdialog.StorageInfoDialog;
++import com.winlator.core.AppUtils;
+ import com.winlator.core.PreloaderDialog;
+ import com.winlator.xenvironment.RootFS;
+ 
++import org.json.JSONException;
++import org.json.JSONObject;
++
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+@@ -69,13 +73,53 @@ public class ContainersFragment extends Fragment {
+         DividerItemDecoration itemDecoration = new DividerItemDecoration(recyclerView.getContext(), DividerItemDecoration.VERTICAL);
+         itemDecoration.setDrawable(ContextCompat.getDrawable(context, R.drawable.list_item_divider));
+         recyclerView.addItemDecoration(itemDecoration);
++        frameLayout.findViewById(R.id.BTQuickStart).setOnClickListener((v) -> quickStart());
+         return frameLayout;
+     }
+ 
++    /**
++     * One-tap path for people who just want to run something: makes a container with the default
++     * settings when there is none yet and opens the Downloads folder, where a tap on a file runs it.
++     */
++    private void quickStart() {
++        if (!RootFS.find(getContext()).isValid()) return;
++
++        ArrayList<Container> containers = manager.getContainers();
++        if (!containers.isEmpty()) {
++            openDownloads(containers.get(0));
++            return;
++        }
++
++        JSONObject data = new JSONObject();
++        try {
++            data.put("name", "Container-1");
++        }
++        catch (JSONException e) {
++            return;
++        }
++
++        preloaderDialog.show(R.string.creating_container);
++        manager.createContainerAsync(data, (container) -> {
++            preloaderDialog.close();
++            if (container != null) {
++                loadContainersList();
++                openDownloads(container);
++            }
++            else AppUtils.showToast(getContext(), R.string.unable_to_create_container);
++        });
++    }
++
++    private void openDownloads(Container container) {
++        MainActivity activity = (MainActivity)getActivity();
++        if (activity == null) return;
++        AppUtils.showToast(activity, R.string.quick_start_hint);
++        activity.showFragment(new ContainerFileManagerFragment(container.id, AppUtils.DIRECTORY_DOWNLOADS));
++    }
++
+     private void loadContainersList() {
+         ArrayList<Container> containers = manager.getContainers();
+         recyclerView.setAdapter(new ContainersAdapter(containers));
+-        if (containers.isEmpty()) emptyTextView.setVisibility(View.VISIBLE);
++        emptyTextView.setVisibility(containers.isEmpty() ? View.VISIBLE : View.GONE);
+     }
+ 
+     @Override
+diff --git a/app/src/main/res/layout/containers_fragment.xml b/app/src/main/res/layout/containers_fragment.xml
+index a954448..3080663 100644
+--- a/app/src/main/res/layout/containers_fragment.xml
++++ b/app/src/main/res/layout/containers_fragment.xml
+@@ -19,4 +19,17 @@
+         android:text="@string/no_items_to_display"
+         android:textSize="24sp"
+         android:visibility="gone" />
++
++    <Button
++        android:id="@+id/BTQuickStart"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="bottom|center_horizontal"
++        android:layout_marginBottom="24dp"
++        android:paddingLeft="24dp"
++        android:paddingRight="24dp"
++        android:minHeight="56dp"
++        android:textSize="18sp"
++        android:textAllCaps="false"
++        android:text="@string/quick_start" />
+ </FrameLayout>
+diff --git a/app/src/main/res/values-pt/strings.xml b/app/src/main/res/values-pt/strings.xml
+index e373dc7..1bb26f8 100644
+--- a/app/src/main/res/values-pt/strings.xml
++++ b/app/src/main/res/values-pt/strings.xml
+@@ -304,4 +304,7 @@
+     <string name="unable_to_launch_from_home_screen">Não foi possível iniciar: o arquivo ou o contêiner não foi encontrado</string>
+     <string name="frame_generation">Geração de Quadros</string>
+     <string name="frame_generation_hint">Funciona quando o jogo roda na metade da taxa de atualização da tela ou menos; limite a taxa de quadros nas configurações do DXVK. Estado atual:</string>
++    <string name="quick_start">Executar um jogo ou instalador</string>
++    <string name="quick_start_hint">Abra a pasta do jogo e toque em setup.exe ou no arquivo do jogo (.exe)</string>
++    <string name="unable_to_create_container">Não foi possível criar o contêiner</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 69cb353..196627b 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -304,4 +304,7 @@
+     <string name="unable_to_launch_from_home_screen">Не удалось запустить: файл или его контейнер не найден</string>
+     <string name="frame_generation">Генерация кадров</string>
+     <string name="frame_generation_hint">Работает, когда игра выдаёт не больше половины частоты экрана, поэтому ограничьте её частоту кадров в настройках DXVK. Состояние сейчас:</string>
++    <string name="quick_start">Запустить игру или установщик</string>
++    <string name="quick_start_hint">Откройте папку с игрой и нажмите на setup.exe или на файл игры (.exe)</string>
++    <string name="unable_to_create_container">Не удалось создать контейнер</string>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 1dd54af..c205f31 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -364,4 +364,7 @@
+     <string name="unable_to_launch_from_home_screen">Unable to launch: the file or its container was not found</string>
+     <string name="frame_generation">Frame Generation</string>
+     <string name="frame_generation_hint">Works when the game runs at half the screen refresh rate or lower, so limit its frame rate in the DXVK settings. Current state:</string>
++    <string name="quick_start">Run a game or an installer</string>
++    <string name="quick_start_hint">Open the game folder and tap setup.exe or the game file (.exe)</string>
++    <string name="unable_to_create_container">Unable to create the container</string>
+ </resources>

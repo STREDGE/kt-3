@@ -1,9 +1,14 @@
 # Доработки Winlator
 
-Два патча поверх официального Winlator 11.2, применяются по порядку:
+Три патча поверх официального Winlator 11.2, применяются по порядку:
 
 1. `home-screen-shortcut.patch` — иконки игр на главном экране Android.
 2. `frame-generation.patch` — генерация промежуточных кадров внутри Winlator.
+3. `quick-start.patch` — кнопка «Запустить игру или установщик» на первом экране.
+
+## Быстрый запуск
+
+Кнопка внизу экрана «Контейнеры». Если контейнера ещё нет, она создаёт его с настройками по умолчанию, затем открывает папку «Загрузки» во встроенном файловом менеджере. Нажатие на файл там запускает его.
 
 ## Иконки на главном экране
 
@@ -55,6 +60,7 @@ cd winlator-app
 git checkout ecd5ab2980de79eb955621cef26a3b4672013875
 git apply ../home-screen-shortcut.patch
 git apply ../frame-generation.patch
+git apply ../quick-start.patch
 ./gradlew :app:assembleDebug
 ```
 
